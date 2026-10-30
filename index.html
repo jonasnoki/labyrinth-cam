@@ -78,8 +78,19 @@
   #fps { position: fixed; left: 16px; top: 16px; color: var(--muted); background: var(--panel); padding: 3px 7px; border-radius: 6px; display: none; }
   #fps.show { display: block; }
 
+  #toolbar {
+    position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+    display: flex; gap: 6px; padding: 6px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    max-width: calc(100vw - 32px);
+  }
+  #toolbar button { white-space: nowrap; padding: 8px 12px; }
+  #toolbar button.primary { grid-column: auto; }
+  #toolbar button[hidden] { display: none; }
+
   @media (max-width: 520px) {
-    #panel { left: 16px; right: 16px; width: auto; top: auto; bottom: 16px; max-height: 46vh; }
+    #panel { left: 16px; right: 16px; width: auto; top: auto; bottom: 76px; max-height: 50vh; }
     #preview { width: 96px; top: 16px; bottom: auto; }
   }
 </style>
@@ -89,15 +100,20 @@
 <video id="preview" playsinline muted></video>
 <div id="fps"></div>
 
+<nav id="toolbar">
+  <button class="primary" id="camBtn">Start camera</button>
+  <button id="switchBtn" hidden>Switch camera</button>
+  <button id="snapBtn">Save PNG</button>
+  <button id="panelBtn" aria-controls="panel">Settings</button>
+</nav>
+
 <aside id="panel">
   <h1>LABYRINTH CAM</h1>
   <p class="sub">Reaction-diffusion line portrait. Dark tones pack the lines tight, light tones open them up.</p>
   <p id="msg" role="alert"></p>
 
   <div class="btns">
-    <button class="primary" id="camBtn">Start camera</button>
     <label class="btn">Open image<input type="file" id="fileInput" accept="image/*"></label>
-    <button id="snapBtn">Save PNG</button>
     <button id="pauseBtn">Pause</button>
     <button id="resetBtn">Reset</button>
   </div>
@@ -137,6 +153,7 @@
   <div class="checks">
     <label><input type="checkbox" id="mirror" checked> Mirror</label>
     <label><input type="checkbox" id="invert"> Invert</label>
+    <label><input type="checkbox" id="autoLevels" checked> Auto levels</label>
     <label><input type="checkbox" id="showCam"> Camera</label>
     <label><input type="checkbox" id="showFps"> FPS</label>
   </div>
@@ -156,6 +173,12 @@ const video = $("preview");
 const msg = $("msg");
 
 const showMsg = (t) => { msg.textContent = t || ""; msg.classList.toggle("show", !!t); };
+
+// Phones: finer stripes (the face is small on screen) and keep the panel out of the way.
+if (matchMedia("(max-width: 520px)").matches) {
+  $("detail").value = "1.4";
+  $("panel").classList.add("hidden");
+}
 
 // ---------------------------------------------------------------- renderer
 let renderer;
@@ -199,6 +222,8 @@ const simFrag = /* glsl */`
   uniform float uFeed, uKill;
   uniform float uRhoMin, uRhoMax;
   uniform float uContrast, uBright;
+  uniform float uLo, uHi;     // auto-levels black / white points
+  uniform float uFit;         // 0 = cover (camera), 1 = contain (images)
   uniform float uReset;
   uniform float uSeed;
   varying vec2 vUv;
@@ -209,11 +234,17 @@ const simFrag = /* glsl */`
     return fract(p.x * p.y);
   }
 
-  // Cover-fit the source into the sim rectangle.
+  // Cover- or contain-fit the source into the sim rectangle.
   vec2 sourceUv(vec2 uv) {
     float ca = uRes.x / uRes.y;
-    if (ca > uSourceAspect) uv.y = 0.5 + (uv.y - 0.5) * (uSourceAspect / ca);
-    else uv.x = 0.5 + (uv.x - 0.5) * (ca / uSourceAspect);
+    float r = ca / uSourceAspect;
+    if (uFit > 0.5) {
+      if (r > 1.0) uv.x = 0.5 + (uv.x - 0.5) * r;        // pillarbox
+      else         uv.y = 0.5 + (uv.y - 0.5) / r;        // letterbox
+    } else {
+      if (r > 1.0) uv.y = 0.5 + (uv.y - 0.5) / r;        // crop top/bottom
+      else         uv.x = 0.5 + (uv.x - 0.5) * r;        // crop sides
+    }
     if (uMirror > 0.5) uv.x = 1.0 - uv.x;
     return uv;
   }
@@ -240,13 +271,19 @@ const simFrag = /* glsl */`
       + 0.2  * (S(1, 0) + S(-1, 0) + S(0, 1) + S(0, -1))
       + 0.05 * (S(1, 1) + S(-1, 1) + S(1, -1) + S(-1, -1));
 
-    // Lightly blurred source tone.
+    // Lightly blurred source tone; outside a contained image is blank paper.
     vec2 suv = sourceUv(vUv);
-    vec2 o = 1.5 / uRes;
-    float L = 0.4 * luma(suv)
-      + 0.15 * (luma(suv + vec2(o.x, 0.0)) + luma(suv - vec2(o.x, 0.0))
-              + luma(suv + vec2(0.0, o.y)) + luma(suv - vec2(0.0, o.y)));
-    L = clamp((L - 0.5) * uContrast + 0.5 + uBright, 0.0, 1.0);
+    float L;
+    if (any(lessThan(suv, vec2(0.0))) || any(greaterThan(suv, vec2(1.0)))) {
+      L = 1.0;
+    } else {
+      vec2 o = 2.0 / uRes;
+      L = 0.4 * luma(suv)
+        + 0.15 * (luma(suv + vec2(o.x, 0.0)) + luma(suv - vec2(o.x, 0.0))
+                + luma(suv + vec2(0.0, o.y)) + luma(suv - vec2(0.0, o.y)));
+      L = clamp((L - uLo) / max(uHi - uLo, 0.05), 0.0, 1.0);
+      L = clamp((L - 0.5) * uContrast + 0.5 + uBright, 0.0, 1.0);
+    }
     float rho = mix(uRhoMax, uRhoMin, L);
 
     float u = c.x, v = c.y;
@@ -313,6 +350,9 @@ const simMat = new THREE.ShaderMaterial({
     uRes: { value: new THREE.Vector2(1, 1) },
     uSourceAspect: { value: source.aspect },
     uMirror: { value: 0 },
+    uFit: { value: 0 },
+    uLo: { value: 0 },
+    uHi: { value: 1 },
     uFeed: { value: 0.029 },
     uKill: { value: 0.057 },
     uRhoMin: { value: 0.06 },
@@ -431,7 +471,7 @@ function makeFallbackSource() {
   blob(320, 470, 260, 90, 0.5, 0.0);     // shoulders
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.NoColorSpace;
-  return { texture: tex, aspect: c.width / c.height, kind: "fallback" };
+  return { texture: tex, aspect: c.width / c.height, kind: "fallback", el: c };
 }
 
 function setSource(s) {
@@ -440,43 +480,123 @@ function setSource(s) {
   simMat.uniforms.uSource.value = s.texture;
   simMat.uniforms.uSourceAspect.value = s.aspect;
   simMat.uniforms.uMirror.value = s.kind === "camera" && $("mirror").checked ? 1 : 0;
+  simMat.uniforms.uFit.value = s.kind === "image" ? 1 : 0;
+  measureLevels(true);
 }
 
+// ---------------------------------------------------------------- auto levels
+// Stretch the source's 2nd–98th luminance percentiles to full range, so flat,
+// mid-grey photos still produce a wide spread of stripe densities.
+const levelCanvas = document.createElement("canvas");
+levelCanvas.width = levelCanvas.height = 64;
+const levelCtx = levelCanvas.getContext("2d", { willReadFrequently: true });
+let autoLevels = true;
+
+function measureLevels(snap) {
+  const u = simMat.uniforms;
+  if (!autoLevels || !source?.el) { u.uLo.value = 0; u.uHi.value = 1; return; }
+  const el = source.el;
+  if (el.videoWidth === 0) return;
+  try { levelCtx.drawImage(el, 0, 0, 64, 64); } catch (_) { return; }
+  const d = levelCtx.getImageData(0, 0, 64, 64).data;
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < d.length; i += 4) hist[Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2])]++;
+  const total = 64 * 64;
+  const pct = (q) => { let acc = 0; for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= q * total) return i / 255; } return 1; };
+  const lo = pct(0.02), hi = Math.max(pct(0.98), lo + 0.05);
+  const k = snap ? 1 : 0.3; // ease for live video so density doesn't flicker
+  u.uLo.value += (lo - u.uLo.value) * k;
+  u.uHi.value += (hi - u.uHi.value) * k;
+}
+setInterval(() => { if (source?.kind === "camera") measureLevels(false); }, 250);
+
 let camStream = null;
-async function startCamera() {
+let camFacing = "user";
+let camTexture = null;
+
+video.addEventListener("resize", () => {
+  if (video.videoWidth && source.kind === "camera") simMat.uniforms.uSourceAspect.value = video.videoWidth / video.videoHeight;
+});
+
+const setMirror = (on) => {
+  $("mirror").checked = on;
+  simMat.uniforms.uMirror.value = source.kind === "camera" && on ? 1 : 0;
+  video.style.transform = on ? "scaleX(-1)" : "none";
+};
+
+async function openStream(videoConstraints) {
+  return navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, ...videoConstraints },
+    audio: false,
+  });
+}
+
+async function startCamera(videoConstraints = { facingMode: camFacing }) {
   showMsg("");
   if (!navigator.mediaDevices?.getUserMedia) {
     showMsg("Camera is not available. Open this page over HTTPS in a recent browser.");
-    return;
+    return false;
   }
+  let stream;
   try {
-    camStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-      audio: false,
-    });
+    // Release the current camera first: phones often allow only one open at a time.
+    camStream?.getTracks().forEach((t) => t.stop());
+    stream = await openStream(videoConstraints);
   } catch (e) {
-    showMsg("Camera access was blocked. Allow camera access for this site and try again.");
-    return;
+    if (camStream) { try { stream = await openStream({ facingMode: camFacing }); } catch (_) {} }
+    if (!stream) {
+      showMsg("Camera access was blocked. Allow camera access for this site and try again.");
+      camStream = null;
+      return false;
+    }
   }
-  video.srcObject = camStream;
+  camStream = stream;
+  video.srcObject = stream;
   await video.play();
-  const tex = new THREE.VideoTexture(video);
-  tex.colorSpace = THREE.NoColorSpace;
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  const updateAspect = () => {
-    if (video.videoWidth) simMat.uniforms.uSourceAspect.value = video.videoWidth / video.videoHeight;
-  };
-  setSource({ texture: tex, aspect: (video.videoWidth || 16) / (video.videoHeight || 9), kind: "camera" });
-  video.addEventListener("resize", updateAspect);
+  if (!camTexture) {
+    camTexture = new THREE.VideoTexture(video);
+    camTexture.colorSpace = THREE.NoColorSpace;
+    camTexture.minFilter = THREE.LinearFilter;
+    camTexture.magFilter = THREE.LinearFilter;
+  }
+  const settingsNow = stream.getVideoTracks()[0]?.getSettings?.() || {};
+  if (settingsNow.facingMode) camFacing = settingsNow.facingMode;
+  setSource({ texture: camTexture, aspect: (video.videoWidth || 16) / (video.videoHeight || 9), kind: "camera", el: video });
+  // Selfie cameras read naturally mirrored; rear cameras do not.
+  setMirror(camFacing !== "environment");
   $("camBtn").textContent = "Stop camera";
+
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+  $("switchBtn").hidden = cams.length < 2;
+  return true;
+}
+
+// Phones: flip front/back via facingMode. Desktops (no facing info): cycle devices.
+async function switchCamera() {
+  if (!camStream) return;
+  const cur = camStream.getVideoTracks()[0]?.getSettings?.() || {};
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+  if (cur.facingMode) {
+    const next = cur.facingMode === "environment" ? "user" : "environment";
+    camFacing = next;
+    if (await startCamera({ facingMode: { exact: next } })) {
+      const now = camStream.getVideoTracks()[0]?.getSettings?.() || {};
+      if (now.deviceId !== cur.deviceId) return;
+    }
+  }
+  if (cams.length < 2) return;
+  const i = cams.findIndex((d) => d.deviceId === cur.deviceId);
+  const nextCam = cams[(i + 1) % cams.length];
+  camFacing = "user";
+  await startCamera({ deviceId: { exact: nextCam.deviceId } });
 }
 
 function stopCamera() {
   camStream?.getTracks().forEach((t) => t.stop());
   camStream = null;
   video.srcObject = null;
-  if (source.kind === "camera") { source.texture.dispose(); setSource(fallbackSource); }
+  $("switchBtn").hidden = true;
+  if (source.kind === "camera") setSource(fallbackSource);
   $("camBtn").textContent = "Start camera";
 }
 
@@ -490,7 +610,7 @@ function loadImage(file) {
     tex.generateMipmaps = false;
     tex.needsUpdate = true;
     if (camStream) stopCamera();
-    setSource({ texture: tex, aspect: img.naturalWidth / img.naturalHeight, kind: "image" });
+    setSource({ texture: tex, aspect: img.naturalWidth / img.naturalHeight, kind: "image", el: img });
     reset();
     URL.revokeObjectURL(url);
   };
@@ -527,10 +647,13 @@ $("mirror").addEventListener("change", (e) => {
   simMat.uniforms.uMirror.value = source.kind === "camera" && e.target.checked ? 1 : 0;
   video.style.transform = e.target.checked ? "scaleX(-1)" : "none";
 });
+$("autoLevels").addEventListener("change", (e) => { autoLevels = e.target.checked; measureLevels(true); });
 $("showCam").addEventListener("change", (e) => video.classList.toggle("show", e.target.checked));
 $("showFps").addEventListener("change", (e) => $("fps").classList.toggle("show", e.target.checked));
 
 $("camBtn").addEventListener("click", () => (camStream ? stopCamera() : startCamera()));
+$("switchBtn").addEventListener("click", switchCamera);
+$("panelBtn").addEventListener("click", () => $("panel").classList.toggle("hidden"));
 $("fileInput").addEventListener("change", (e) => { const f = e.target.files?.[0]; if (f) loadImage(f); e.target.value = ""; });
 $("resetBtn").addEventListener("click", reset);
 const togglePause = () => {
