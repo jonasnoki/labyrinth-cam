@@ -173,10 +173,15 @@ const video = $("preview");
 const msg = $("msg");
 
 const showMsg = (t) => { msg.textContent = t || ""; msg.classList.toggle("show", !!t); };
+// Surface runtime errors in the panel instead of failing silently (e.g. on mobile).
+const showError = (text) => { showMsg("Error: " + text); $("panel").classList.remove("hidden"); };
+window.addEventListener("error", (e) => showError(e.message));
+window.addEventListener("unhandledrejection", (e) => showError(e.reason?.message || String(e.reason)));
 
 // Phones: finer stripes (the face is small on screen) and keep the panel out of the way.
 if (matchMedia("(max-width: 520px)").matches) {
-  $("detail").value = "1.4";
+  $("detail").value = "1.8";
+  $("rhoMax").value = "2.2";
   $("panel").classList.add("hidden");
 }
 
@@ -398,8 +403,9 @@ const makeTarget = (w, h) => new THREE.WebGLRenderTarget(w, h, {
   stencilBuffer: false,
 });
 
+let rebuildTimer = 0;
 const settings = {
-  detail: 1,
+  detail: parseFloat($("detail").value),
   iters: 20,
   paused: false,
 };
@@ -674,7 +680,6 @@ document.addEventListener("keydown", (e) => {
   else if (k === "s") snapRequested = true;
 });
 
-let rebuildTimer = 0;
 function scheduleRebuild() {
   clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(rebuild, 120);
